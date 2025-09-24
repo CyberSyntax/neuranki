@@ -14,7 +14,7 @@ Semantic search over your Anki notes (all fields), with deck-filtered indexing, 
 
 ## Install
 ```bash
-git clone https://github.com/<you>/neuranki.git
+git clone https://github.com/CyberSyntax/neuranki.git
 cd neuranki
 python -m venv .venv
 source .venv/bin/activate  # on Windows: .venv\Scripts\activate

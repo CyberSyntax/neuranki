@@ -1,0 +1,7 @@
+{
+  "anki_db_path": "/absolute/path/to/collection.anki2",
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "hnsw": { "M": 16, "ef_construction": 400, "ef_search": 512 },
+  "cleaner_version": 2,
+  "filter": { "allow_deck_ids": [], "deny_deck_ids": [] }
+}

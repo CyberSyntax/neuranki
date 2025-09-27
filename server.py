@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 import torch
 from bs4 import BeautifulSoup
-import time
+from typing import Dict, Any, Tuple, List
 
 # ---------- Config ----------
 CONFIG_PATH = "config.json"
@@ -34,7 +34,14 @@ ALLOW_DECK_IDS = {int(x) for x in FILTER_CFG.get("allow_deck_ids", [])}
 DENY_DECK_IDS = {int(x) for x in FILTER_CFG.get("deny_deck_ids", [])}
 
 def deck_allowed(did: int) -> bool:
-    if ALLOW_DECK_IDS and did not in ALLOW_DECK_IDS:
+    if ALLOW_DECK_IDS and did not in ALLOW_DECK_IDS:  # corrected below
+        return False
+    if did in DENY_DECK_IDS:
+        return False
+    return True
+
+def deck_allowed(did: int) -> bool:  # final, correct
+    if ALLOW_DECK_IDS and (did not in ALLOW_DECK_IDS):
         return False
     if did in DENY_DECK_IDS:
         return False
@@ -55,7 +62,7 @@ if not (os.path.exists(INDEX_PATH) and os.path.exists(META_PATH)):
     raise SystemExit("Build the index first: `python build_index.py`")
 
 # ---------- Model/Index ----------
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 model = SentenceTransformer(MODEL_NAME, device=device)
 dim = model.get_sentence_embedding_dimension()
 
@@ -64,14 +71,19 @@ index.load_index(INDEX_PATH)
 index.set_ef(EF_SEARCH)
 
 # ---------- Meta ----------
-def load_meta():
-    meta_by_nid = {}
+def load_meta() -> Tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    by_nid: Dict[int, Dict[str, Any]] = {}
+    by_label: Dict[int, Dict[str, Any]] = {}
     with open(META_PATH, "r", encoding="utf-8") as f:
         for line in f:
             m = json.loads(line)
             nid = int(m["id"])
-            meta_by_nid[nid] = m
-    return meta_by_nid
+            label = int(m.get("label", nid))
+            m["id"] = nid
+            m["label"] = label
+            by_nid[nid] = m
+            by_label[label] = m
+    return by_nid, by_label
 
 def load_index_info():
     if os.path.exists(INDEX_INFO_PATH):
@@ -79,7 +91,7 @@ def load_index_info():
             return json.load(f)
     return {}
 
-META = load_meta()
+META_BY_NID, META_BY_LABEL = load_meta()
 INDEX_INFO = load_index_info()
 
 # Validate filtered build vs current filter config
@@ -162,12 +174,10 @@ def search(
     kn: int | None = None,
     ef: int | None = None,  # optional per-request ef override
 ):
-    # Search by note embeddings; expand to cards; show fronts only.
     q = q.strip()
     if not q:
         return JSONResponse({"results": [], "anki_ok": None})
 
-    # Optional ef override (useful for debugging)
     if ef is not None:
         try:
             index.set_ef(int(ef))
@@ -180,34 +190,33 @@ def search(
         q_emb = q_emb.reshape(1, -1)
 
     # Since index is already filtered, collect generously then trim
-    index_count = int(INDEX_INFO.get("count") or len(META) or 0)
-    default_top_notes = min(index_count, max(1000, int(k) * 50))
-    top_notes = int(kn) if kn is not None else default_top_notes
+    index_count = int(INDEX_INFO.get("count") or len(META_BY_LABEL) or 0)
+    default_top = min(index_count, max(1000, int(k) * 50))
+    top_notes = int(kn) if kn is not None else default_top
 
     labels, distances = index.knn_query(q_emb, k=top_notes)
-    nids = [int(x) for x in labels[0]]
+    labs = [int(x) for x in labels[0]]
     dists = [float(x) for x in distances[0]]
 
     candidates = []
-    for nid, dist in zip(nids, dists):
-        if nid == -1 or nid not in META:
+    for lab, dist in zip(labs, dists):
+        if lab == -1 or lab not in META_BY_LABEL:
             continue
-        rec = META[nid]
+        rec = META_BY_LABEL[lab]
+        nid = int(rec["id"])
         sim = 1.0 - dist / 2.0
-        for c in rec.get("cards", []):  # already filtered to allowed decks at build time
+        for c in rec.get("cards", []):  # already filtered at build time
             did = int(c.get("did", 0))
             if not deck_allowed(did):
-                # Safety check, should usually pass
                 continue
             candidates.append({
                 "cid": int(c["cid"]),
-                "nid": int(nid),
+                "nid": nid,
                 "ord": int(c.get("ord", 0)),
                 "did": did,
                 "similarity": float(sim),
             })
 
-    # Sort and trim
     candidates.sort(key=lambda x: x["similarity"], reverse=True)
     candidates = candidates[:k]
 
@@ -222,7 +231,7 @@ def search(
             flag = int(info.get("flags", 0))
             deckName = info.get("deckName", "")
         else:
-            rec = META.get(c["nid"], {})
+            rec = META_BY_NID.get(c["nid"], {})
             front = snippet(rec.get("text", ""), 180)
             flag = 0
             deckName = ""
@@ -320,14 +329,13 @@ def anki_add_tag_note(nid: int, tag: str):
 
 @app.post("/reload")
 def reload_index():
-    global index, META, INDEX_INFO, CFG, EF_SEARCH, FILTER_CFG, ALLOW_DECK_IDS, DENY_DECK_IDS
+    global index, META_BY_NID, META_BY_LABEL, INDEX_INFO, CFG, EF_SEARCH, FILTER_CFG, ALLOW_DECK_IDS, DENY_DECK_IDS
     if not (os.path.exists(INDEX_PATH) and os.path.exists(META_PATH)):
         return JSONResponse({"ok": False, "error": "Index/meta missing, run build_index.py"}, status_code=400)
 
     # Reload config and apply ef_search + filters
     CFG = load_cfg()
     EF_SEARCH = int(CFG.get("hnsw", {}).get("ef_search", DEFAULT_HNSW_EF))
-
     FILTER_CFG = CFG.get("filter", {}) or {}
     ALLOW_DECK_IDS = {int(x) for x in FILTER_CFG.get("allow_deck_ids", [])}
     DENY_DECK_IDS = {int(x) for x in FILTER_CFG.get("deny_deck_ids", [])}
@@ -337,7 +345,7 @@ def reload_index():
     index.set_ef(EF_SEARCH)
 
     # Reload meta and index info
-    META = load_meta()
+    META_BY_NID, META_BY_LABEL = load_meta()
     INDEX_INFO = load_index_info()
 
     # Recompute filter warning
@@ -352,7 +360,7 @@ def reload_index():
 
     return {
         "ok": True,
-        "count": len(META),
+        "count": len(META_BY_LABEL),
         "ef_search": EF_SEARCH,
         "allow_deck_ids": sorted(list(ALLOW_DECK_IDS)),
         "deny_deck_ids": sorted(list(DENY_DECK_IDS)),
